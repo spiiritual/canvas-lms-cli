@@ -1,0 +1,1 @@
+canvas-lms-cli: A CLI for interacting with the Canvas LMS from a student's perspective, designed for easy human and agent use
