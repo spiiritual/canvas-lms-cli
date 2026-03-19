@@ -8,5 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+canvas-app-traffic
+canvas_tokens.pkl
 
 .DS_Store
