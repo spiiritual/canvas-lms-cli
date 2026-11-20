@@ -1,7 +1,10 @@
 import httpx
+import json
 import logging
-import time
+import os
 import pickle
+import time
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 HEADERS = {
@@ -11,45 +14,66 @@ HEADERS = {
     "Cache-Control": "no-cache",
 }
 
+# Fixed location so the CLI works from any directory (e.g. when an agent runs it).
+CONFIG_DIR = (
+    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "canvas-lms-cli"
+)
+TOKEN_FILE = CONFIG_DIR / "tokens.json"
+LEGACY_TOKEN_FILE = Path("canvas_tokens.pkl")
+
+# Fallback if Canvas doesn't send expires_in (its access tokens normally last 1 hour).
+DEFAULT_EXPIRES_IN = 3600
+EXPIRY_MARGIN = 60
+
+
+def load_tokens() -> dict:
+    if TOKEN_FILE.exists():
+        return json.loads(TOKEN_FILE.read_text())
+
+    # One-time migration from the old pickle file in the current directory.
+    if LEGACY_TOKEN_FILE.exists():
+        with open(LEGACY_TOKEN_FILE, "rb") as f:
+            data = pickle.load(f)
+        write_tokens(data)
+        logging.info(f"Migrated tokens from {LEGACY_TOKEN_FILE} to {TOKEN_FILE}")
+        return data
+
+    raise Exception(
+        "No tokens found. Please authenticate first with canvas-lms-cli authenticate <link>."
+    )
+
+
+def write_tokens(data: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    # Create with owner-only permissions: this file grants access to your account.
+    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+
 
 def get_domain() -> str:
-    try:
-        with open("canvas_tokens.pkl", "rb") as f:
-            data = pickle.load(f)
-    except FileNotFoundError:
-        raise Exception("No tokens found. Please authenticate first.")
-
-    return data["domain"]
+    return load_tokens()["domain"]
 
 
 def retrieve_access_token() -> str:
-    try:
-        with open("canvas_tokens.pkl", "rb") as f:
-            data = pickle.load(f)
-    except FileNotFoundError:
-        raise Exception(
-            "No tokens found. Please authenticate first with canvas-lms-cli authenticate <link>."
-        )
+    data = load_tokens()
 
-    expiry = data["access_token_expiry"]
-
-    if time.time() > expiry:
+    if time.time() > data["access_token_expiry"]:
         logging.info("Access token expired, refreshing...")
-
-        refresh_token = data["refresh_token"]
-        client_id = data["client_id"]
-        client_secret = data["client_secret"]
-        domain = data["domain"]
-
-        access_token = refresh_access_token(
-            client_id, client_secret, domain, refresh_token
+        access_token, refresh_token, expires_in = refresh_access_token(
+            data["client_id"], data["client_secret"], data["domain"], data["refresh_token"]
         )
         save_tokens_to_file(
-            access_token, client_id, client_secret, domain, refresh_token
+            access_token,
+            data["client_id"],
+            data["client_secret"],
+            data["domain"],
+            refresh_token,
+            expires_in,
         )
         return access_token
-    else:
-        return data["access_token"]
+
+    return data["access_token"]
 
 
 def refresh_access_token(
@@ -57,7 +81,7 @@ def refresh_access_token(
     client_secret: str,
     domain: str,
     refresh_token: str,
-) -> str:
+) -> tuple[str, str, int]:
     r = httpx.post(
         f"https://{domain}/login/oauth2/token",
         headers={
@@ -73,13 +97,24 @@ def refresh_access_token(
         },
     )
 
+    # 400/401 here means Canvas no longer accepts the refresh token (revoked in
+    # Approved Integrations, logged out of mobile sessions, or disabled by the school).
+    if r.status_code in (400, 401):
+        raise Exception(
+            "Your Canvas login has expired or was revoked. Generate a new Mobile Login "
+            "QR code and run: canvas-lms-cli authenticate <LINK>\n"
+            f"(Canvas said: {r.status_code} - {r.text})"
+        )
     if r.status_code != 200:
         raise Exception(f"Error refreshing token: {r.status_code} - {r.text}")
 
     data = r.json()
-    access_token = data["access_token"]
-
-    return access_token
+    # Canvas normally keeps the same refresh token, but use a new one if it sends one.
+    return (
+        data["access_token"],
+        data.get("refresh_token", refresh_token),
+        data.get("expires_in", DEFAULT_EXPIRES_IN),
+    )
 
 
 def save_tokens_to_file(
@@ -88,25 +123,28 @@ def save_tokens_to_file(
     client_secret: str,
     domain: str,
     refresh_token: str,
+    expires_in: int = None,
 ) -> None:
+    if expires_in is None:
+        expires_in = DEFAULT_EXPIRES_IN
+
     data = {
         "access_token": access_token,
         "client_id": client_id,
         "client_secret": client_secret,
         "domain": domain,
         "refresh_token": refresh_token,
-        "access_token_expiry": time.time()
-        + 3600,  # Canvas access tokens expire after 1 hour
+        # Refresh a minute early so a token never expires mid-request.
+        "access_token_expiry": time.time() + expires_in - EXPIRY_MARGIN,
     }
 
-    with open("canvas_tokens.pkl", "wb") as f:
-        pickle.dump(data, f)
+    write_tokens(data)
 
 
 def authenticate_from_url(url: str) -> None:
     code, domain = parse_qr_code_url(url)
     client_id, client_secret = get_client_info(domain)
-    access_token, refresh_token = exchange_code_for_tokens(
+    access_token, refresh_token, expires_in = exchange_code_for_tokens(
         domain, client_id, client_secret, code
     )
     save_tokens_to_file(
@@ -115,6 +153,7 @@ def authenticate_from_url(url: str) -> None:
         client_secret=client_secret,
         domain=domain,
         refresh_token=refresh_token,
+        expires_in=expires_in,
     )
 
     print("Authentication successful!")
@@ -147,7 +186,7 @@ def get_client_info(domain: str) -> tuple[str, str, str]:
 
 def exchange_code_for_tokens(
     domain: str, client_id: str, client_secret: str, code: str
-) -> tuple[str, str]:
+) -> tuple[str, str, int]:
     r = httpx.post(
         f"https://{domain}/login/oauth2/token",
         headers={
@@ -170,5 +209,6 @@ def exchange_code_for_tokens(
     data = r.json()
     access_token = data["access_token"]
     refresh_token = data["refresh_token"]
+    expires_in = data.get("expires_in", DEFAULT_EXPIRES_IN)
 
-    return (access_token, refresh_token)
+    return (access_token, refresh_token, expires_in)
